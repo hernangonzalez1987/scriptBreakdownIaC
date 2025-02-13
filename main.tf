@@ -2,7 +2,7 @@ provider "aws" {
 
   access_key                  = "mock_access_key"
   secret_key                  = "mock_secret_key"
-  region                      = "sa-east-1"
+  region                      = var.region
 
   s3_use_path_style           = true
   skip_credentials_validation = true
@@ -10,80 +10,64 @@ provider "aws" {
   skip_requesting_account_id  = true
 
   endpoints {
-    s3             = "http://s3.localhost.localstack.cloud:4566"
-    sns            = "http://localhost:4566"
-    sqs            = "http://localhost:4566"
+      s3             = "http://s3.localhost.localstack.cloud:4566"
+      sns            = "http://localhost:4566"
+      sqs            = "http://localhost:4566"
   }
 }
 
-resource "aws_s3_bucket" "scripts_bucket" {
-  bucket = "scripts"
-}
+module "aws_s3_scripts_bucket" {
+  source = "./modules/aws_s3_bucket"
 
-resource "aws_s3_bucket" "breakdowns_bucket" {
-  bucket = "breakdowns"
-}
-
-resource "aws_sqs_queue" "breakdown_events_queue_deadletter" {
-  name                      = "breakdown-events-queue"
-  delay_seconds             = 0
-  max_message_size          = 2048
-  message_retention_seconds = 86400
-  receive_wait_time_seconds = 10
-}
-
-resource "aws_sqs_queue" "breakdown_events_queue" {
-  name                      = "breakdown-events-queue"
-  delay_seconds             = 0
-  max_message_size          = 2048
-  message_retention_seconds = 86400
-  receive_wait_time_seconds = 10
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.breakdown_events_queue_deadletter.arn
-    maxReceiveCount     = 4
-  })
-}
-
-resource "aws_sns_topic" "breakdown_events_topic" {
-  name            = "breakdown-events-topic"
-  delivery_policy = <<EOF
-{
-  "http": {
-    "defaultHealthyRetryPolicy": {
-      "minDelayTarget": 20,
-      "maxDelayTarget": 20,
-      "numRetries": 3,
-      "numMaxDelayRetries": 0,
-      "numNoDelayRetries": 0,
-      "numMinDelayRetries": 0,
-      "backoffFunction": "linear"
-    },
-    "disableSubscriptionOverrides": false,
-    "defaultThrottlePolicy": {
-      "maxReceivesPerSecond": 1
-    }
+  bucket_name       = "scripts"
+  tags              = {
+    Environment = terraform.workspace
   }
+  versioning_enabled = false
+  sse_algorithm      = "AES256"
 }
-EOF
-}
 
-data "aws_iam_policy_document" "breakdown_events_queue-sns_policy" {
-  statement {
-    sid    = "First"
-    effect = "Allow"
+module "aws_s3_breakdowns_bucket" {
+  source = "./modules/aws_s3_bucket"
 
-    principals {
-      type        = "*"
-      identifiers = ["*"]
-    }
-
-    actions   = ["sqs:SendMessage"]
-    resources = [aws_sqs_queue.breakdown_events_queue.arn]
-
-    condition {
-      test     = "ArnEquals"
-      variable = "aws:SourceArn"
-      values   = [aws_sns_topic.breakdown_events_topic.arn]
-    }
+  bucket_name       = "breakdowns"
+  tags              = {
+    Environment = terraform.workspace
   }
+  versioning_enabled = false
+  sse_algorithm      = "AES256"
+}
+
+module "aws_sqs" {
+  source = "./modules/aws_sqs"
+
+  queue_name_deadletter = "breakdown-events-queue-deadletter"
+  queue_name            = "breakdown-events-queue"
+  policy = <<POLICY
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "sqs:SendMessage",
+        "Resource": "arn:aws:sqs:*:*:breakdown-events-queue",
+        "Condition": {
+          "ArnEquals": {
+           "aws:SourceArn":     
+              "${module.aws_s3_scripts_bucket.bucket_arn}" 
+           }
+        }
+      }
+    ]
+  }
+  POLICY
+}
+
+module "aws_scripts_notification" {
+  source = "./modules/aws_s3_bucket_notification"
+
+  bucket = module.aws_s3_scripts_bucket.bucket_id
+  events = ["s3:ObjectCreated:*"]
+  queue_arn = module.aws_sqs.sqs_arn
 }
